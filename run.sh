@@ -32,7 +32,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # SECTION 0 : CONFIGURATION & TUNABLES
 # ────────────────────────────────────────────────────────────────────────────
-SENTINEL_VERSION="1.0.0"
+SENTINEL_VERSION="1.2.0"
 SENTINEL_NAME="sentinel"
 
 # Logging targets
@@ -56,6 +56,18 @@ CONTAINER_REFRESH_EVERY=10
 # drop zone (/tmp, /dev/shm, /var/tmp). Set to 0 if you run temp binaries
 # legitimately and only want signature-based detection.
 KILL_SUSPICIOUS_PATH=1
+
+# Memory monitor (NEW). If a single process holds >MEM_PERCENT_THRESHOLD % of
+# total RAM for >= MEM_SUSTAIN_SECONDS it is terminated. Set KILL_MEM_HOGS=0 to
+# disable (the host CPU monitor still runs). MEM_SAMPLES mirrors the CPU logic.
+KILL_MEM_HOGS=1
+MEM_PERCENT_THRESHOLD=50
+MEM_SUSTAIN_SECONDS=5
+MEM_SAMPLES=$(awk "BEGIN{printf \"%d\", ($MEM_SUSTAIN_SECONDS/$POLL_INTERVAL)+2}")
+
+# Kernel clock ticks per second (100 on almost all Linux). Used to convert the
+# /proc/<pid>/stat cumulative CPU-time delta into a fraction of one core.
+HZ=$(getconf CLK_TCK 2>/dev/null); HZ=${HZ:-100}
 
 # ────────────────────────────────────────────────────────────────────────────
 # SECTION 0a : APPROVED / SAFETY LISTS  (EDIT THESE!)
@@ -188,12 +200,58 @@ is_suspicious_path() {
     esac
 }
 
+
+# Cumulative CPU time (utime+stime) for a pid, in clock ticks. Field positions
+# after the "(comm)" block: state,ppid,pgrp,session,tty,tpgid,flags,minflt,
+# cminflt,majflt,cmajflt,utime,stime -> utime is a[12], stime is a[13].
+read_cpu_ticks() {
+    local pid=$1
+    awk '{ i = index($0, ")"); r = substr($0, i + 2); n = split(r, a, " ");
+           if (n >= 13) print a[12] + a[13] }' "/proc/${pid}/stat" 2>/dev/null
+}
+
+# Resident set size of a pid in kB.
+read_rss_kb() {
+    awk '/VmRSS:/ { print $2 }' "/proc/${1}/status" 2>/dev/null
+}
+
+# True if a process's executable lives in a standard, package-managed location.
+# Non-standard locations (tmp, shm, home, /run, cwd) mark it as untrusted.
+is_trusted_exe() {
+    local pid=$1 exe
+    exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null)
+    [[ -z "$exe" ]] && return 1
+    case "$exe" in
+        /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|/usr/local/bin/*|/usr/local/sbin/*|\
+        /usr/libexec/*|/usr/lib/*|/usr/lib64/*|/lib/*|/lib64/*|/opt/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Decide whether a HIGH-RESOURCE process may be terminated even if it matched
+# the immune list (e.g. is named python/java/mysql). We override the immunity
+# when the process is running from an untrusted location or via a suspicious
+# path in its command line — this catches miners that masquerade as a normal
+# service but were dropped into /tmp, /dev/shm, or a user's home directory.
+would_terminate_hog() {
+    local pid=$1 name=$2 cmdline
+    is_immune "$name" "$pid" || return 0            # not immune -> kill
+    is_trusted_exe "$pid" || return 0               # immune but untrusted exe -> kill
+    cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+    [[ "$cmdline" =~ /tmp/|/dev/shm|/var/tmp|/run/user/ ]] && return 0
+    return 1                                         # genuinely trusted -> protect
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 # SECTION 2 : GLOBAL STATE & HELPERS
 # ────────────────────────────────────────────────────────────────────────────
 LOCK="/var/lock/${SENTINEL_NAME}.lock"
 declare -A CPU_HITS            # pid -> count of consecutive breaches
 declare -A CPU_PIDMAP          # pid -> name snapshot (for logging)
+declare -A CPU_TICKS           # pid -> last cumulative CPU-time ticks
+declare -A CPU_NANO            # pid -> last sample wall-clock (ns)
+declare -A MEM_HITS            # pid -> consecutive high-memory breaches
+declare -A MEM_PIDMAP          # pid -> name snapshot (for logging)
 
 # Timestamped logging to stdout AND /var/log/sentinel.log
 log() {
@@ -203,6 +261,23 @@ log() {
 }
 
 die()   { log "FATAL: ${1}"; exit 1; }
+
+# Lightweight actions that should work even without root (no logging side effects).
+case "${1:-}" in
+    --version) echo "${SENTINEL_NAME} v${SENTINEL_VERSION}"; exit 0 ;;
+    --help|-h) cat <<HLP
+${SENTINEL_NAME} v${SENTINEL_VERSION} — miner & rogue-process watchdog (made by IamGunpoint)
+
+Usage (run as root):
+  sudo ${0##*/}                  # install systemd service (24/7) and start monitoring
+  sudo ${0##*/} --install        # install + enable + start the service
+  sudo ${0##*/} --status         # show service status
+  sudo ${0##*/} --diagnose       # print top CPU/RAM consumers + status + log
+  sudo ${0##*/} --uninstall      # stop, disable, remove the service
+  ${0##*/} --version             # print version
+HLP
+        exit 0 ;;
+esac
 
 # Require root
 [[ $EUID -ne 0 ]] && die "This script MUST run as root (EUid=$EUID). Use: sudo $0"
@@ -295,44 +370,91 @@ check_miner_names() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# SECTION 6 : TARGET IDENTIFICATION — SERVICE 2 : HIGH-RESOURCE MONITOR
-# ────────────────────────────────────────────────────────────────────────────
-# Track any process that is using >$CPU_PERCENT_THRESHOLD % CPU and has
-# sustained it for >= $CPU_SUSTAIN_SECONDS. Note: ps %CPU is per-sampling-frame
-# so we accumulate consecutive breaches via a sliding "hit counter", which in
-# practice approximates a sustained-load window for a fixed-interval poller.
+# SECTION 6 : TARGET IDENTIFICATION — SERVICE 2 : HIGH-RESOURCE (CPU + MEM)
+# ----------------------------------------------------------------------------
+# WHY WE SAMPLE /proc AND NOT `ps %CPU`:
+#   * GNU `ps %CPU` is the AVERAGE over a process's whole lifetime, so a rogue
+#     that only started pegging a moment ago, or that ran fine for an hour and
+#     then spiked, shows a misleadingly low value. It also divides across cores.
+#   * Here we read the process's CUMULATIVE cpu time from /proc/<pid>/stat each
+#     poll and divide the DELTA by our own wall-clock delta. That gives the
+#     fraction of a SINGLE core it is burning RIGHT NOW (can exceed 100% for
+#     multithreaded), so a pinned core is caught on any core count.
+#   * A memory monitor (RSS % of total RAM) is added so RAM hogs are caught too.
+# ----------------------------------------------------------------------------
+# Fraction (0-100+) of a single core a process used over the polling gap.
+cpu_percent_since() {
+    local d=$1 dn=$2
+    [[ "$dn" -le 0 ]] && { echo 0; return; }
+    awk -v d="$d" -v dn="$dn" -v hz="$HZ" 'BEGIN{ printf "%d", (d * 1000000000.0 * 100.0) / (hz * dn) }'
+}
+
+# High-CPU monitor — core-count independent, instantaneous.
 check_high_cpu() {
-    # print pid,pcpu,comm  (exclude zero-CPU to cut noise)
-    local pid pcpu name breach=0
+    local line pid name now_ns prev_ns cur prev d dn percent
+    now_ns=$(date +%s%N)
     while IFS= read -r line; do
         pid=$(awk '{print $1}' <<<"$line")
-        pcpu=$(awk '{print $2}' <<<"$line")
-        name=$(awk '{print $3}' <<<"$line")
+        name=$(awk '{print $2}' <<<"$line")
 
-        # Floating point comparison against threshold
-        breach=$(awk -v c="$pcpu" -v t="$CPU_PERCENT_THRESHOLD" \
-                     'BEGIN{print (c > t)?1:0}')
+        cur=$(read_cpu_ticks "$pid")
+        [[ -z "$cur" ]] && { unset CPU_TICKS["$pid"] CPU_NANO["$pid"]; continue; }
 
-        if [[ "$breach" == "1" ]]; then
-            # Increment hit counter
-            local n=${CPU_HITS[$pid]:-0}
-            ((n++))
-            CPU_HITS[$pid]=$n
-            CPU_PIDMAP[$pid]="$name"
-            # Sustained breach for too long?
-            # (Samples in flight ≈ sustained_seconds / interval)
+        prev=${CPU_TICKS[$pid]:-}; prev_ns=${CPU_NANO[$pid]:-}
+        if [[ -z "$prev" ]]; then          # first observation: just baseline it
+            CPU_TICKS[$pid]=$cur; CPU_NANO[$pid]=$now_ns; continue
+        fi
+        d=$((cur - prev)); [[ "$d" -lt 0 ]] && d=0
+        dn=$((now_ns - prev_ns))
+        percent=$(cpu_percent_since "$d" "$dn")
+        CPU_TICKS[$pid]=$cur; CPU_NANO[$pid]=$now_ns
+
+        if (( percent > CPU_PERCENT_THRESHOLD )); then
+            local n=${CPU_HITS[$pid]:-0}; ((n++)); CPU_HITS[$pid]=$n; CPU_PIDMAP[$pid]="$name"
             if (( n >= SAMPLES )); then
-                is_immune "$name" "$pid" && { unset CPU_HITS[$pid]; continue; }
+                # Respect the safe list UNLESS the process is untrusted.
+                if ! would_terminate_hog "$pid" "$name"; then
+                    unset CPU_HITS["$pid"]; continue
+                fi
                 terminate "$pid" "$name" \
-                    "Exceeded ${CPU_PERCENT_THRESHOLD}% CPU (${pcpu}%) sustained >${CPU_SUSTAIN_SECONDS}s"
-                unset CPU_HITS[$pid] CPU_PIDMAP[$pid]
+                    "Exceeded ${CPU_PERCENT_THRESHOLD}% of a core (${percent}%) sustained >${CPU_SUSTAIN_SECONDS}s"
+                unset CPU_HITS["$pid"] CPU_PIDMAP["$pid"] CPU_TICKS["$pid"] CPU_NANO["$pid"]
             fi
         else
-            # Reset this pid's breach window when it drops below threshold
-            unset CPU_HITS[$pid] CPU_PIDMAP[$pid]
+            unset CPU_HITS["$pid"] CPU_PIDMAP["$pid"]
         fi
-    done < <(ps -eo pid=,pcpu=,comm=)
+    done < <(ps -eo pid=,comm=)
 }
+
+# High-memory monitor — terminate any process holding >MEM_PERCENT_THRESHOLD %
+# of total RAM for >= MEM_SUSTAIN_SECONDS. Gated by KILL_MEM_HOGS.
+check_high_mem() {
+    [[ "$KILL_MEM_HOGS" == "1" ]] || return
+    local line pid name rss_kb rss_percent
+    local mem_total_kb
+    mem_total_kb=$(awk '/MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null)
+    [[ -n "$mem_total_kb" ]] || return
+    while IFS= read -r line; do
+        pid=$(awk '{print $1}' <<<"$line")
+        name=$(awk '{print $2}' <<<"$line")
+        rss_kb=$(read_rss_kb "$pid"); rss_kb=${rss_kb:-0}
+        rss_percent=$(awk -v r="$rss_kb" -v t="$mem_total_kb" 'BEGIN{ printf "%d", (r * 100.0) / t }')
+        if (( rss_percent > MEM_PERCENT_THRESHOLD )); then
+            local n=${MEM_HITS["$pid"]:-0}; ((n++)); MEM_HITS["$pid"]=$n; MEM_PIDMAP["$pid"]="$name"
+            if (( n >= MEM_SAMPLES )); then
+                if ! would_terminate_hog "$pid" "$name"; then
+                    unset MEM_HITS["$pid"]; continue
+                fi
+                terminate "$pid" "$name" \
+                    "Exceeded ${MEM_PERCENT_THRESHOLD}% RAM (${rss_percent}% ~ ${rss_kb} kB) sustained >${MEM_SUSTAIN_SECONDS}s"
+                unset MEM_HITS["$pid"] MEM_PIDMAP["$pid"]
+            fi
+        else
+            unset MEM_HITS["$pid"] MEM_PIDMAP["$pid"]
+        fi
+    done < <(ps -eo pid=,comm=)
+}
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # SECTION 7 : TARGET IDENTIFICATION — SERVICE 3 : KVM/QEMU VIRTUALIZATION
@@ -462,9 +584,14 @@ UNIT
 
     chmod 644 "$unit"
     systemctl daemon-reload
+    systemctl daemon-reload
     systemctl enable "$SENTINEL_NAME" >/dev/null 2>&1
-    log "Persistence: enabling + starting ${SENTINEL_NAME}.service"
     systemctl start "$SENTINEL_NAME" >/dev/null 2>&1
+    if systemctl is-active --quiet "$SENTINEL_NAME" 2>/dev/null; then
+        log "Persistence: ${SENTINEL_NAME}.service is ACTIVE (auto-restart on boot)."
+    else
+        log "WARN: ${SENTINEL_NAME}.service did NOT start — check: journalctl -u ${SENTINEL_NAME} -n 40"
+    fi
 
     # Re-exec under systemd so THIS shell becomes the supervised child; if the
     # unit already started us, fall through.
@@ -472,6 +599,36 @@ UNIT
         log "Persistence: handing control to systemd (sentinel.service)."
         exit 0
     fi
+}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SECTION 10 : MAINTENANCE — uninstall & diagnose helpers
+# ────────────────────────────────────────────────────────────────────────────
+uninstall_service() {
+    log "Uninstall: stopping + disabling ${SENTINEL_NAME}.service"
+    systemctl stop "$SENTINEL_NAME" 2>/dev/null
+    systemctl disable "$SENTINEL_NAME" 2>/dev/null
+    rm -f "/etc/systemd/system/${SENTINEL_NAME}.service"
+    systemctl daemon-reload 2>/dev/null
+    log "Uninstall: removed ${SENTINEL_NAME}.service"
+}
+
+# Print the biggest CPU/RAM consumers, service state, and recent log so you can
+# identify exactly what is eating the box BEFORE the watchdog terminates it.
+diagnose() {
+    echo "=== ${SENTINEL_NAME} diagnose v${SENTINEL_VERSION} ==="
+    echo "--- Top CPU consumers (pid, %cpu, %mem, RSS, name, args) ---"
+    ps -eo pid=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu | head -n 12
+    echo
+    echo "--- Top memory consumers ---"
+    ps -eo pid=,pcpu=,pmem=,rss=,comm=,args= --sort=-rss | head -n 12
+    echo
+    echo "--- Service status ---"
+    systemctl status "$SENTINEL_NAME" --no-pager 2>/dev/null | head -n 16 || echo "(not a service)"
+    echo
+    echo "--- Last 20 log lines ---"
+    tail -n 20 "$LOG_FILE" 2>/dev/null || echo "(no log yet — run as root and it appears)"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -482,7 +639,8 @@ banner() {
     log "║  ${SENTINEL_NAME} v${SENTINEL_VERSION}  —  Miner & Rogue-Process Watchdog          ║"
     log "║  made by IamGunpoint                                        ║"
     log "║  Log: ${LOG_FILE}                                            ║"
-    log "║  CPU threshold: >${CPU_PERCENT_THRESHOLD}% for ${CPU_SUSTAIN_SECONDS}s | interval ${POLL_INTERVAL}s ║"
+    log "║  CPU threshold: >${CPU_PERCENT_THRESHOLD}% of a core / ${CPU_SUSTAIN_SECONDS}s  | interval ${POLL_INTERVAL}s ║"
+    log "║  RAM threshold: >${MEM_PERCENT_THRESHOLD}% of RAM / ${MEM_SUSTAIN_SECONDS}s  (kill=${KILL_MEM_HOGS})           ║"
     log "╚══════════════════════════════════════════════════════════════╝"
 }
 
@@ -490,6 +648,15 @@ banner() {
 # SECTION 11 : MAIN MONITORING LOOP  (infinite, sub-second)
 # ────────────────────────────────────────────────────────────────────────────
 main() {
+    case "${1:-}" in
+        --install)   ensure_systemd_service; exit $? ;;
+        --uninstall) uninstall_service; exit $? ;;
+        --status)    systemctl status "$SENTINEL_NAME" --no-pager 2>/dev/null; exit $? ;;
+        --version)   echo "${SENTINEL_NAME} v${SENTINEL_VERSION}"; exit 0 ;;
+        --diagnose)  diagnose; exit $? ;;
+        --foreground|"")  : ;;
+        *) echo "Unknown option: ${1} (try --install, --status, --diagnose, --foreground)"; exit 2 ;;
+    esac
     ensure_systemd_service
     banner
     log "START: ${SENTINEL_NAME} watchdog armed (pid $$)."
@@ -499,8 +666,9 @@ main() {
         # 1. Known miner list (host) — most likely threat, cheap via ps.
         check_miner_names
 
-        # 2. High-resource rogue-process monitor.
+        # 2. High-resource rogue-process monitors (CPU + memory).
         check_high_cpu
+        check_high_mem
 
         # 3. KVM/QEMU virtualization guard (only if qemu/kvm binaries present).
         if command -v qemu-system-x86_64 >/dev/null 2>&1 \
