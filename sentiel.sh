@@ -85,6 +85,10 @@ declare -a SAFE_CPUS=(
     top htop ps pgrep pidof watch dd ddrescue  # the monitor's own kin
     bash dash sh zsh                          # safety: never kill shells of root
     sentinel sentineld                         # never kill ourselves
+    # Login terminals & essential system services: STILL these are legitimate and
+    # MUST never be killed by the miner matcher.
+    agetty login mingetty getty init systemd-logind dbus-daemon rsyslogd sshd crond
+    atd NetworkManager systemd-udevd polkitd chronyd auditd edac-poller
 )
 
 # Explicitly allow KVM/QEMU VMs that carry one of these strings in their
@@ -144,26 +148,25 @@ declare -a MINER_NAMES=(
 #     a process as a miner regardless of its binary name. These catch renamed
 #     copies and shell wrappers. Applied to the full `ps args` line.
 declare -a MINER_STRINGS=(
-    "stratum+tcp" "stratum+ssl" "stratum+tls" "stratum2" "stratum"
-    "getwork" "getblocktemplate" "coinbase"
+    # Miner-pool / protocol endpoints (strong signals, not generic args)
+    "stratum+tcp" "stratum+ssl" "stratum+tls" "stratum2" "stratum://" "stratum+tcp://"
     "nicehash" "nanopool" "minergate" "minexmr" "supportxmr" "moneroocean"
     "dwarfpool" "hashspeed" "kryptex" "ethermine" "ethpool" "f2pool"
-    "prohashing" "miningpoolhub" "mining-pool" "hashpool" "pool.mine"
-    "--coin=monero" "--algo" "--algo=randomx" "--algo=cryptonight"
-    "--coin" "-o stratum" "-u wallet" "--donate-level" "--nicehash"
-    "xmrig" "xmr-stak" "ethminer" "--opencl" "--cuda" "--cpu-affinity"
-    "cryptonight" "ethash" "equihash" "lyra2" "x16r" "x16s" "cn_slow_hash"
-    "--tls" "--threads" "--av" "--randomx" "--cpu-priority"
-    "minerd" "cgminer" "cgminer.exe" "cpuminer" "cpuminer-opt"
-    "ethminer.exe" "--farm-reward" "--pool" "--port" "--user" "--pass"
-    "nheqminer" "quadriga" "--output" "-P" "stratum://" "stratum+tcp://"
-    "--api-bind" "--background" "bfgminer" "sgminer" "claymore"
-    "phoenixminer" "nanominer" "lolMiner" "teamredminer" "gminer"
-    "--bminer" "bminer" "eth-proxy" "-–curl" "wget.*\.sh" "curl.*.sh"
-    "minergate-cli" "kdevtmpfsi" "kinsing" "/tmp/.*miner" "sha256d"
-    "scrypt" "x11" "keccak" "blake2b" "decred" "cash"
+    "prohashing" "miningpoolhub" "mining-pool" "pool.mine" "minexmr.com"
+    # Explicit coin-miner CLI flags (the ones that are actually miner-specific)
+    "--coin=monero" "--algo=randomx" "--algo=cryptonight" "--donate-level"
+    "--nicehash" "--opencl" "--cuda" "--cpu-affinity" "--cpu-priority"
+    "--randomx" "--api-bind" "--bminer"
+    # Well-known miner binary footprints (also caught by name list, but useful)
+    "xmrig" "xmr-stak" "ethminer" "minerd" "cgminer" "cpuminer" "nheqminer"
+    "claymore" "phoenixminer" "nanominer" "lolminer" "teamredminer" "gminer"
+    "minergate-cli" "kdevtmpfsi" "kinsing"
+    # Mining algorithms appearing in a hostile cmd line
+    "cryptonight" "cn_slow_hash" "equihash" "lyra2" "x16r" "x16s" "sha256d"
+    "keccak" "blake2b" "decred" "--farm-reward" "eth-proxy" "miningproxy"
+    # Drop-in downloader/wrapper patterns
+    "wget.*\\.sh" "curl.*\\.sh" "/tmp/.*miner"
 )
-
 # 1c. Suspicious executable LOCATIONS — coin miners almost universally drop into
 #     world-writable/anon dirs and reuse cutesy names. If a flagged name or an
 #     unknown binary is exec'd straight from here, treat it as a miner.
@@ -222,8 +225,8 @@ is_trusted_exe() {
     exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null)
     [[ -z "$exe" ]] && return 1
     case "$exe" in
-        /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|/usr/local/bin/*|/usr/local/sbin/*|\
-        /usr/libexec/*|/usr/lib/*|/usr/lib64/*|/lib/*|/lib64/*|/opt/*) return 0 ;;
+        /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|\
+        /usr/libexec/*|/usr/lib/*|/usr/lib64/*|/lib/*|/lib64/*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -336,6 +339,23 @@ terminate() {
     log "TERMINATED pid=$pid ($name) with SIGKILL — $reason"
 }
 
+
+
+# True if a process should be treated as TRUSTED (never a miner target):
+#   * kernel threads / processes whose exe we cannot read
+#   * binaries in distro-managed paths (/usr/bin, /usr/sbin, /bin, /sbin, /usr/lib*)
+#   * /usr/local and /opt are NOT trusted (common drop zones for miners)
+is_trusted_exe_check() {
+    local pid="$1" exe
+    exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null)
+    [[ -z "$exe" ]] && return 0              # kernel thread / unreadable -> treat as trusted
+    case "$exe" in
+        /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|\
+        /usr/libexec/*|/usr/lib/*|/usr/lib64/*|/lib/*|/lib64/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 # SECTION 5 : TARGET IDENTIFICATION  — SERVICE 1 : MINER LIST MATCH (host)
 # ────────────────────────────────────────────────────────────────────────────
@@ -343,27 +363,40 @@ terminate() {
 # matches the compiled miner signatures -> terminate it.
 check_miner_names() {
     # -eo args includes the full command line; comm is truncated exec name.
-    # We read with a while loop to avoid forks per process.
-    local line pid name argline lname larg
+    local line pid name argline lname larg trusted=0
     while IFS= read -r line; do
-        # handle names containing spaces minimally (use last field split safely)
         pid=$(awk '{print $1}' <<<"$line")
         name=$(awk '{print $2}' <<<"$line")
         argline=$(cut -d' ' -f3- <<<"$line")
         is_immune "$name" "$pid" && continue
 
-        # Lowercase for case-insensitive signature match.
         lname=${name,,}
         larg=${argline,,}
 
-        # Match executable name OR full command line against miner signatures.
+        # SAFETY SPINE: a *trusted* (distro-managed / kernel / no-exe) process is
+        # NEVER a miner target. Coin miners are always dropped binaries living in
+        # /tmp, /dev/shm, ~, /var/tmp or user-installed /usr/local paths. This
+        # single check is what stops us from ever killing agetty, edac-poller,
+        # systemd, kernel threads, or any legitimate service.
+        if is_trusted_exe_check "$pid"; then
+            [[ "$lname" =~ $MINER_NAME_RE ]] && {
+                # Even a trusted location is killable if the *binary name* is an
+                # unambiguous miner (covers legit-looking installs of real miners).
+                case "$lname" in
+                    xmrig*|ethminer*|ccminer*|cgminer*|sgminer*|minerd*|bfgminer*|claymore*|phoenixminer*|nanominer*|t-rex*|lolminer*|teamredminer*|nbminer*|gminer*|rigel*|wildrig*|kawpowminer*|xmr-stak*|nheqminer*|cpuminer*)
+                        terminate "$pid" "$name" "Matched known miner binary name (trusted path)"
+                        continue ;;
+                esac
+            }
+            continue
+        fi
+
+        # Untrusted executable -> eligible for BOTH name and cmdline matching.
         if [[ "$lname" =~ $MINER_NAME_RE ]] || [[ "$larg" =~ $MINER_NAME_RE ]] \
            || [[ "$larg" =~ $MINER_STRING_RE ]]; then
-            terminate "$pid" "$name" "Matched known miner list (name/cmdline signature)"
+            terminate "$pid" "$name" "Matched known miner (name/cmdline) in untrusted location"
         elif [[ "$KILL_SUSPICIOUS_PATH" == "1" ]] && is_suspicious_path "$pid" \
               && [[ "$lname" != "$SENTINEL_NAME" ]]; then
-            # Unknown binary living in a world-writable dir: treat as a miner
-            # drop-in unless it is a known/good process already whitelisted.
             terminate "$pid" "$name" "Unknown binary in suspicious path /tmp|/dev/shm|/var/tmp"
         fi
     done < <(ps -eo pid=,comm=,args=)
